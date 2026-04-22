@@ -277,6 +277,19 @@ def rgb_to_gray(x_rgb: torch.Tensor) -> torch.Tensor:
     return (x_rgb * w.view(1, 3, 1, 1)).sum(dim=1, keepdim=True)
 
 
+@torch.no_grad()
+def project_to_latent_sphere(z: torch.Tensor) -> None:
+    """
+    BIRD 的关键约束: 每次更新后把输入噪声投影回半径 sqrt(D) 的球面.
+    D 是单样本 latent 维度 (C*H*W).
+    """
+    flat = z.view(z.shape[0], -1)
+    dim = flat.shape[1]
+    target_radius = float(dim) ** 0.5
+    norm = flat.norm(dim=1, keepdim=True).clamp_min(1e-9)
+    flat.mul_(target_radius / norm)
+
+
 def restore_ir_image(y: torch.Tensor, prior: SD21Prior, config: dict) -> dict:
     """BIRD 联合优化. y 是任意宽高比的 (1, 1, H, W)."""
     device = prior.device
@@ -322,8 +335,8 @@ def restore_ir_image(y: torch.Tensor, prior: SD21Prior, config: dict) -> dict:
     ])
 
     log = {
-        "loss": [], "data_loss": [], "reg_loss": [], "z_reg": [],
-        "z_mean": [], "z_std": [], "z_absmax": [],
+        "loss": [], "data_loss": [], "reg_loss": [],
+        "z_mean": [], "z_std": [], "z_absmax": [], "z_norm": [],
     }
 
     # 中间 RGB 快照, 用于诊断 SD 输出何时崩坏.
@@ -345,12 +358,7 @@ def restore_ir_image(y: torch.Tensor, prior: SD21Prior, config: dict) -> dict:
 
         data_loss = F.mse_loss(y_hat, y)
         reg_loss = degradation.regularizer()
-        # z_T 高斯正则: 把 z_T 的均值推向 0, 方差推向 1, 防止漂出 SD 的训练流形.
-        z_reg = (
-            0.1 * (z_T.pow(2).mean() - 1.0).pow(2)
-            + 0.01 * z_T.mean().pow(2)
-        )
-        loss = data_loss + reg_loss + z_reg
+        loss = data_loss + reg_loss
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(
@@ -358,19 +366,22 @@ def restore_ir_image(y: torch.Tensor, prior: SD21Prior, config: dict) -> dict:
             max_norm=opt_cfg["grad_clip_norm"],
         )
         optimizer.step()
+        # 参考 BIRD: 每一步更新后把 z_T 投影回球面, 保持在先验噪声流形上.
+        project_to_latent_sphere(z_T)
 
         log["loss"].append(loss.item())
         log["data_loss"].append(data_loss.item())
         log["reg_loss"].append(float(reg_loss.item()))
-        log["z_reg"].append(float(z_reg.item()))
 
         with torch.no_grad():
             z_mean = z_T.mean().item()
             z_std = z_T.std().item()
             z_absmax = z_T.abs().max().item()
+            z_norm = z_T.flatten(1).norm(dim=1).mean().item()
         log["z_mean"].append(z_mean)
         log["z_std"].append(z_std)
         log["z_absmax"].append(z_absmax)
+        log["z_norm"].append(z_norm)
 
         if step % snapshot_interval == 0 or step == opt_cfg["num_steps"] - 1:
             with torch.no_grad():
@@ -386,8 +397,7 @@ def restore_ir_image(y: torch.Tensor, prior: SD21Prior, config: dict) -> dict:
             info = {
                 "loss": f"{loss.item():.3f}",
                 "data": f"{data_loss.item():.3f}",
-                "zreg": f"{z_reg.item():.3f}",
-                "z": f"{z_mean:+.2f}/{z_std:.2f}/{z_absmax:.1f}",
+                "z": f"{z_mean:+.2f}/{z_std:.2f}/{z_absmax:.1f}|n={z_norm:.1f}",
                 "rgb": f"[{rgb_min:+.2f},{rgb_max:+.2f}]{'!NaN' if rgb_hasnan else ''}",
             }
             if deg_cfg["enable_gamma"]:
@@ -615,6 +625,7 @@ def main():
             "final_mean": result["log"]["z_mean"][-1],
             "final_std": result["log"]["z_std"][-1],
             "final_absmax": result["log"]["z_absmax"][-1],
+            "final_norm": result["log"]["z_norm"][-1],
             "max_absmax_over_training": max(result["log"]["z_absmax"]),
             "max_std_over_training": max(result["log"]["z_std"]),
         },
