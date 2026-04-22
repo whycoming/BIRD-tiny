@@ -9,10 +9,11 @@ model:
   dtype: "float16"
   device: "cuda"
   # 推理时的 text prompt.
-  #   ""                                  -> null prompt (最干净, 推荐起点)
-  #   "grayscale photo, monochrome"       -> 弱的灰度引导
-  #   "infrared thermal image, grayscale" -> 更强的 IR 域偏置 (效果有限)
-  prompt: ""
+  #   ""                                  -> null prompt (SD 2.1 base unconditional 质量极差, 不要用)
+  #   "a high quality black and white photograph" -> 灰度偏置 + 非空, 质量显著提升
+  #   "infrared thermal image, grayscale"           -> 更强的 IR 域偏置 (效果有限)
+  # 重要: SD 2.1 base 在空 prompt + 无 CFG + 短 DDIM 下会直接输出伪影.
+  prompt: "a high quality black and white photograph"
 
 # ---------------------------------------------------------------------
 # I/O 相关 (支持任意宽高比)
@@ -30,6 +31,13 @@ io:
   # 是否把输出 resize 回原图尺寸 (false 则保留处理分辨率).
   restore_original_size: true
 
+  # 是否强制把 SD 处理分辨率 pad 成正方形 (推荐 true).
+  # SD 2.1 base 训练时严格 512x512, 非正方形会产生伪影. 开启后流程是:
+  #   1) AR-preserving resize 到能塞进 s×s 的尺寸 (s=long_edge)
+  #   2) reflect pad 到 s×s 给 SD 处理
+  #   3) 输出 crop 回内容区, 再 resize 回原图
+  force_square: true
+
 # ---------------------------------------------------------------------
 # BIRD 联合优化
 # ---------------------------------------------------------------------
@@ -37,7 +45,9 @@ optimization:
   num_steps: 500
   num_ddim_steps: 10
   warm_start_steps: 100
-  lr_z: 0.01
+  # lr_z 从 0.01 降到 0.001: 原值在无 z_T 正则 + 500 步下会把 z_T 漂出高斯流形,
+  # 配合新加的 z_T 高斯正则 + 这里的降档可以稳住.
+  lr_z: 0.001
   lr_theta: 0.01
   grad_clip_norm: 1.0
   seed: 42

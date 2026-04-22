@@ -135,8 +135,10 @@ class SD21Prior(nn.Module):
         prompt = model_cfg["prompt"]
 
         print(f"[SD21Prior] Loading {model_id} ...")
+        # VAE 强制 fp32: SD 2.1 的 VAE 在 fp16 下对 OOD latent 容易出 NaN/黑块,
+        # 放大 z_T 漂移带来的伪影.
         self.vae = AutoencoderKL.from_pretrained(
-            model_id, subfolder="vae", torch_dtype=self.dtype
+            model_id, subfolder="vae", torch_dtype=torch.float32
         ).to(self.device)
         self.unet = UNet2DConditionModel.from_pretrained(
             model_id, subfolder="unet", torch_dtype=self.dtype
@@ -190,8 +192,9 @@ class SD21Prior(nn.Module):
         return z
 
     def decode(self, z_0: torch.Tensor) -> torch.Tensor:
-        z = z_0 / 0.18215
-        return self.vae.decode(z.to(self.dtype)).sample.float()
+        z = z_0 / self.vae.config.scale_factor
+        # VAE 是 fp32, 这里不再 cast 到 self.dtype
+        return self.vae.decode(z.float()).sample.float()
 
 
 # =====================================================================
@@ -237,11 +240,16 @@ class CompositeDegradation(nn.Module):
         return self.fpn_row @ self.fpn_col
 
     def forward(self, x_gray: torch.Tensor) -> torch.Tensor:
+        """x_gray in [-1, 1] (SD VAE 原生空间)."""
         k = self.normalized_kernel()
         x = F.conv2d(x_gray, k, padding=self.kernel_size // 2)
         if self.enable_gamma:
             g = torch.clamp(self.gamma, 0.3, 3.0)
-            x = torch.clamp(x, 1e-6, 1.0) ** g
+            # gamma 在负数上没定义, 先 map 到 [0,1] 做 gamma 再 map 回 [-1,1].
+            # 用 STE 保留上下界外的梯度.
+            x01 = (x + 1.0) / 2.0
+            x01_safe = x01 + (x01.clamp(1e-6, 1.0) - x01).detach()
+            x = x01_safe.pow(g) * 2.0 - 1.0
         if self.enable_fpn:
             fpn = self.fpn_pattern().unsqueeze(0).unsqueeze(0)
             x = x + fpn
@@ -293,8 +301,9 @@ def restore_ir_image(y: torch.Tensor, prior: SD21Prior, config: dict) -> dict:
         with torch.no_grad():
             z_warm = torch.randn_like(z_T)
             z_0_warm = prior.ddim_reverse(z_warm, opt_cfg["num_ddim_steps"])
-            x_rgb_warm = (prior.decode(z_0_warm) + 1) / 2
-            x_gray_warm = rgb_to_gray(x_rgb_warm).clamp(0, 1)
+            # 全链路 [-1, 1] 对齐 SD VAE 原生空间
+            x_rgb_warm = prior.decode(z_0_warm)
+            x_gray_warm = rgb_to_gray(x_rgb_warm).clamp(-1, 1)
 
         theta_opt = torch.optim.Adam(degradation.parameters(), lr=opt_cfg["lr_theta"])
         pbar = tqdm(range(opt_cfg["warm_start_steps"]), desc="warm_start")
@@ -312,7 +321,14 @@ def restore_ir_image(y: torch.Tensor, prior: SD21Prior, config: dict) -> dict:
         {"params": degradation.parameters(), "lr": opt_cfg["lr_theta"]},
     ])
 
-    log = {"loss": [], "data_loss": [], "reg_loss": []}
+    log = {
+        "loss": [], "data_loss": [], "reg_loss": [], "z_reg": [],
+        "z_mean": [], "z_std": [], "z_absmax": [],
+    }
+
+    # 中间 RGB 快照, 用于诊断 SD 输出何时崩坏.
+    snapshot_interval = max(1, opt_cfg["num_steps"] // 5)
+    rgb_snapshots = []
 
     print(f"[joint_opt] {opt_cfg['num_steps']} steps ...")
     pbar = tqdm(range(opt_cfg["num_steps"]), desc="joint_opt")
@@ -320,13 +336,21 @@ def restore_ir_image(y: torch.Tensor, prior: SD21Prior, config: dict) -> dict:
         optimizer.zero_grad()
 
         z_0 = prior.ddim_reverse(z_T, opt_cfg["num_ddim_steps"])
-        x_rgb = (prior.decode(z_0) + 1) / 2
-        x_gray = rgb_to_gray(x_rgb).clamp(0, 1)
+        x_rgb = prior.decode(z_0)
+        x_gray_raw = rgb_to_gray(x_rgb)
+        # STE clamp: forward 截到 [-1,1], backward 原样透传梯度. 这样 z_T 能收到
+        # "像素越界多少"的信号, 而不是被 clamp 吃掉梯度.
+        x_gray = x_gray_raw + (x_gray_raw.clamp(-1, 1) - x_gray_raw).detach()
         y_hat = degradation(x_gray)
 
         data_loss = F.mse_loss(y_hat, y)
         reg_loss = degradation.regularizer()
-        loss = data_loss + reg_loss
+        # z_T 高斯正则: 把 z_T 的均值推向 0, 方差推向 1, 防止漂出 SD 的训练流形.
+        z_reg = (
+            0.1 * (z_T.pow(2).mean() - 1.0).pow(2)
+            + 0.01 * z_T.mean().pow(2)
+        )
+        loss = data_loss + reg_loss + z_reg
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(
@@ -338,9 +362,34 @@ def restore_ir_image(y: torch.Tensor, prior: SD21Prior, config: dict) -> dict:
         log["loss"].append(loss.item())
         log["data_loss"].append(data_loss.item())
         log["reg_loss"].append(float(reg_loss.item()))
+        log["z_reg"].append(float(z_reg.item()))
+
+        with torch.no_grad():
+            z_mean = z_T.mean().item()
+            z_std = z_T.std().item()
+            z_absmax = z_T.abs().max().item()
+        log["z_mean"].append(z_mean)
+        log["z_std"].append(z_std)
+        log["z_absmax"].append(z_absmax)
+
+        if step % snapshot_interval == 0 or step == opt_cfg["num_steps"] - 1:
+            with torch.no_grad():
+                # 保存用 [0,1] 空间, 方便 save_image 直接落盘
+                snap = ((x_rgb.detach().float() + 1.0) / 2.0).clamp(0, 1).cpu()
+                rgb_snapshots.append((step, snap))
 
         if step % 10 == 0:
-            info = {"loss": f"{loss.item():.4f}", "data": f"{data_loss.item():.4f}"}
+            with torch.no_grad():
+                rgb_min = x_rgb.min().item()
+                rgb_max = x_rgb.max().item()
+                rgb_hasnan = bool(torch.isnan(x_rgb).any().item())
+            info = {
+                "loss": f"{loss.item():.3f}",
+                "data": f"{data_loss.item():.3f}",
+                "zreg": f"{z_reg.item():.3f}",
+                "z": f"{z_mean:+.2f}/{z_std:.2f}/{z_absmax:.1f}",
+                "rgb": f"[{rgb_min:+.2f},{rgb_max:+.2f}]{'!NaN' if rgb_hasnan else ''}",
+            }
             if deg_cfg["enable_gamma"]:
                 info["gamma"] = f"{degradation.gamma.item():.3f}"
             pbar.set_postfix(info)
@@ -348,14 +397,18 @@ def restore_ir_image(y: torch.Tensor, prior: SD21Prior, config: dict) -> dict:
     # ---- Final ----
     with torch.no_grad():
         z_0_final = prior.ddim_reverse(z_T, opt_cfg["num_ddim_steps"])
-        x_rgb_final = ((prior.decode(z_0_final) + 1) / 2).clamp(0, 1)
-        x_gray_final = rgb_to_gray(x_rgb_final).clamp(0, 1)
+        x_rgb_final_m11 = prior.decode(z_0_final).clamp(-1, 1)
+        x_gray_final_m11 = rgb_to_gray(x_rgb_final_m11).clamp(-1, 1)
+        # 返回给 main 时统一 map 到 [0,1], main 无需感知 [-1,1] 内部约定.
+        x_rgb_final = (x_rgb_final_m11 + 1.0) / 2.0
+        x_gray_final = (x_gray_final_m11 + 1.0) / 2.0
 
     return {
         "x_restored": x_gray_final,
         "x_rgb_debug": x_rgb_final,
         "degradation": degradation,
         "log": log,
+        "rgb_snapshots": rgb_snapshots,
     }
 
 
@@ -363,25 +416,73 @@ def restore_ir_image(y: torch.Tensor, prior: SD21Prior, config: dict) -> dict:
 # I/O (支持任意宽高比)
 # =====================================================================
 
-def load_ir_image(path: str, long_edge: int, max_long_edge: int) -> tuple:
+def load_ir_image(
+    path: str,
+    long_edge: int,
+    max_long_edge: int,
+    force_square: bool = True,
+) -> tuple:
     """
-    加载 IR 图像, 保持宽高比 resize 到处理分辨率, 短边 round 到 8 的倍数.
+    加载 IR 图像. 两种模式:
+      - force_square=True (推荐): AR-preserving resize 使最长边 ≤ s=long_edge,
+        然后 reflect pad 到 s×s. SD 2.1 base 严格 512×512 训练, 正方形画面质量
+        远高于非正方形.
+      - force_square=False: 老路径, 保持非正方形处理分辨率.
 
     Returns:
         tensor: (1, 1, proc_H, proc_W), [0, 1]
-        orig_size: (orig_H, orig_W) for later resize-back
-        proc_size: (proc_H, proc_W)
+        orig_size: (orig_H, orig_W) — 原图尺寸
+        proc_size: (proc_H, proc_W) — SD 看到的尺寸 (正方形模式下是 s×s)
+        content_bbox: (top, left, fit_h, fit_w) — 真正内容在 tensor 里的矩形.
+            非正方形模式下等于 (0, 0, proc_H, proc_W).
     """
     img = Image.open(path).convert("L")
     orig_w, orig_h = img.size  # PIL 是 (W, H), 注意顺序
 
+    if force_square:
+        s = min(long_edge, max_long_edge)
+        s = max(8, (s // 8) * 8)
+
+        if orig_h >= orig_w:
+            scale = s / orig_h
+            fit_h = s
+            fit_w = max(1, int(round(orig_w * scale)))
+        else:
+            scale = s / orig_w
+            fit_w = s
+            fit_h = max(1, int(round(orig_h * scale)))
+        # fit_h / fit_w 不必是 8 的倍数, 因为最终 pad 到 s×s, 而 s 是 8 的倍数.
+
+        img_resized = img.resize((fit_w, fit_h), Image.BICUBIC)
+        # 与 SD VAE 原生空间对齐: [-1, 1]
+        arr = np.array(img_resized).astype(np.float32) / 127.5 - 1.0
+        content = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
+
+        pad_top = (s - fit_h) // 2
+        pad_bottom = s - fit_h - pad_top
+        pad_left = (s - fit_w) // 2
+        pad_right = s - fit_w - pad_left
+
+        # reflect pad: 给 SD 一个"连续"的画面, 边界没有黑块突变.
+        # 注意 F.pad 的顺序是 (last_left, last_right, 2nd_last_top, 2nd_last_bottom)
+        tensor = F.pad(
+            content,
+            (pad_left, pad_right, pad_top, pad_bottom),
+            mode="reflect",
+        )
+        return (
+            tensor,
+            (orig_h, orig_w),
+            (s, s),
+            (pad_top, pad_left, fit_h, fit_w),
+        )
+
+    # Legacy: 非正方形路径
     proc_h, proc_w = compute_processing_size(orig_h, orig_w, long_edge, max_long_edge)
-
-    img_resized = img.resize((proc_w, proc_h), Image.BICUBIC)  # PIL 用 (W, H)
-    arr = np.array(img_resized).astype(np.float32) / 255.0
+    img_resized = img.resize((proc_w, proc_h), Image.BICUBIC)
+    arr = np.array(img_resized).astype(np.float32) / 127.5 - 1.0
     tensor = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
-
-    return tensor, (orig_h, orig_w), (proc_h, proc_w)
+    return tensor, (orig_h, orig_w), (proc_h, proc_w), (0, 0, proc_h, proc_w)
 
 
 def resize_to_original(
@@ -445,20 +546,26 @@ def main():
 
     prior = SD21Prior(config["model"])
 
-    # Load IR image with arbitrary aspect ratio
+    # Load IR image
     long_edge = config["io"]["long_edge"]
     max_long_edge = config["io"]["max_long_edge"]
+    force_square = config["io"].get("force_square", True)
     print(f"[io] Loading: {args.input}")
-    y, (orig_h, orig_w), (proc_h, proc_w) = load_ir_image(
-        args.input, long_edge=long_edge, max_long_edge=max_long_edge
+    y, (orig_h, orig_w), (proc_h, proc_w), content_bbox = load_ir_image(
+        args.input,
+        long_edge=long_edge,
+        max_long_edge=max_long_edge,
+        force_square=force_square,
     )
     y = y.to(config["model"]["device"])
+    bbox_top, bbox_left, bbox_h, bbox_w = content_bbox
     print(f"[io] Original size: {orig_h}x{orig_w}")
-    print(f"[io] Processing size: {proc_h}x{proc_w} (aspect ratio: {proc_w/proc_h:.3f})")
+    print(f"[io] Processing size: {proc_h}x{proc_w} (force_square={force_square})")
+    print(f"[io] Content bbox in proc canvas: top={bbox_top} left={bbox_left} "
+          f"h={bbox_h} w={bbox_w}")
     print(f"[io] IR tensor: {y.shape}, range [{y.min():.3f}, {y.max():.3f}]")
 
-    if proc_h != proc_w:
-        # SD 2.1 is trained on 512x512 square; non-square may produce artifacts
+    if not force_square and proc_h != proc_w:
         ar = max(proc_w / proc_h, proc_h / proc_w)
         if ar > 2.0:
             print(f"[warn] Extreme aspect ratio {ar:.2f}:1 may cause SD artifacts.")
@@ -466,9 +573,14 @@ def main():
     # Run BIRD
     result = restore_ir_image(y, prior, config)
 
-    # Resize to original if requested
-    x_restored = result["x_restored"]
-    x_rgb_debug = result["x_rgb_debug"]
+    # 先从 s×s 正方形画布里裁回真正内容区 (非正方形模式下 crop 等于恒等),
+    # 然后再 resize 回原图尺寸.
+    x_restored = result["x_restored"][
+        ..., bbox_top:bbox_top + bbox_h, bbox_left:bbox_left + bbox_w
+    ]
+    x_rgb_debug = result["x_rgb_debug"][
+        ..., bbox_top:bbox_top + bbox_h, bbox_left:bbox_left + bbox_w
+    ]
     if config["io"]["restore_original_size"]:
         print(f"[io] Resizing output back to {orig_h}x{orig_w}")
         x_restored = resize_to_original(x_restored, orig_h, orig_w)
@@ -486,6 +598,10 @@ def main():
     if config["degradation"]["enable_fpn"]:
         save_fpn_vis(result["degradation"], output_dir / f"{stem}_fpn.png")
 
+    # 诊断用中间 RGB 快照
+    for snap_step, snap_tensor in result["rgb_snapshots"]:
+        save_image(snap_tensor, output_dir / f"{stem}_rgb_step{snap_step:04d}.png")
+
     summary = {
         "input": str(args.input),
         "output": str(output_path),
@@ -495,6 +611,13 @@ def main():
         "final_loss": result["log"]["loss"][-1],
         "final_data_loss": result["log"]["data_loss"][-1],
         "final_reg_loss": result["log"]["reg_loss"][-1],
+        "z_stats": {
+            "final_mean": result["log"]["z_mean"][-1],
+            "final_std": result["log"]["z_std"][-1],
+            "final_absmax": result["log"]["z_absmax"][-1],
+            "max_absmax_over_training": max(result["log"]["z_absmax"]),
+            "max_std_over_training": max(result["log"]["z_std"]),
+        },
         "gamma": (
             result["degradation"].gamma.item()
             if config["degradation"]["enable_gamma"] else None
