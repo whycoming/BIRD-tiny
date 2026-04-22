@@ -170,25 +170,23 @@ class SD21Prior(nn.Module):
 
     def ddim_reverse(self, z_T: torch.Tensor, num_steps: int) -> torch.Tensor:
         self.scheduler.set_timesteps(num_steps, device=self.device)
-        timesteps = self.scheduler.timesteps
-        alphas_cumprod = self.scheduler.alphas_cumprod.to(self.device)
-
         z = z_T
-        for i, t in enumerate(timesteps):
-            z_in = z.to(self.dtype)
+        for t in self.scheduler.timesteps:
+            # 与 BIRD 参考实现一致: 使用 scheduler.step 的官方 DDIM 递推,
+            # 并保持 use_clipped_model_output=True.
+            z_in = self.scheduler.scale_model_input(z.to(self.dtype), t)
             noise_pred = self.unet(
                 z_in, t, encoder_hidden_states=self.text_emb
             ).sample.float()
-
-            alpha_t = alphas_cumprod[t]
-            if i + 1 < len(timesteps):
-                alpha_prev = alphas_cumprod[timesteps[i + 1]]
-            else:
-                alpha_prev = torch.tensor(1.0, device=self.device, dtype=torch.float32)
-
-            x_0_pred = (z - (1 - alpha_t).sqrt() * noise_pred) / alpha_t.sqrt()
-            dir_t = (1 - alpha_prev).sqrt() * noise_pred
-            z = alpha_prev.sqrt() * x_0_pred + dir_t
+            step_out = self.scheduler.step(
+                noise_pred,
+                t,
+                z,
+                eta=0.0,
+                use_clipped_model_output=True,
+                return_dict=True,
+            )
+            z = step_out.prev_sample
         return z
 
     def decode(self, z_0: torch.Tensor) -> torch.Tensor:
